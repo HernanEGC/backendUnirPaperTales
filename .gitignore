@@ -1,13 +1,14 @@
 # macOS
 .DS_Store
 
-# IntelliJ
+# IDE
 .idea/
+**/.idea/
 *.iml
 
-# Maven
-/target/
-/out/
+# Build outputs
+**/target/
+**/out/
 
 # Logs
 *.log
@@ -16,3 +17,5 @@
 .env
 .env.*
 
+# Internal migration backups
+.git-nested-backups/

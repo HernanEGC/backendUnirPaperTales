@@ -1,0 +1,54 @@
+server:
+  port: 8082 # Puerto en el que se ejecutará el microservicio de órdenes
+
+spring:
+  application:
+    name: orders
+
+  ## Database Configuration
+  datasource:
+    url: ${DB_URL:jdbc:mysql://localhost:3307/db_ordenes}
+    driver-class-name: ${DB_DRIVER:com.mysql.cj.jdbc.Driver}
+    username: ${DB_USER:root}
+    password: ${DB_PASSWORD:root_password}
+  sql:
+    init:
+      mode: always
+      continue-on-error: true
+      schema-locations:
+        - classpath:db/schema.sql
+        - classpath:db/indices.sql
+      data-locations:
+        - classpath:db/ejemplos.sql
+  jpa:
+    show-sql: true
+    hibernate:
+      ddl-auto: validate
+    database-platform: org.hibernate.dialect.MySQLDialect
+    properties:
+      hibernate:
+        format_sql: true
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          public-key-location: classpath:keys/public.pem
+
+## Logging Configuration
+logging:
+  level:
+    org.hibernate.SQL: DEBUG
+    org.hibernate.type.descriptor.sql.BasicBinder: TRACE
+    org.springframework.data.jpa: DEBUG
+
+
+## Eureka Client Configuration
+eureka:
+  client:
+    service-url:
+      defaultZone: ${EUREKA_URL:http://localhost:8761/eureka}
+  instance:
+    preferIpAddress: false
+    hostname: localhost
+
+

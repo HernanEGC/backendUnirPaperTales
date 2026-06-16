@@ -1,0 +1,73 @@
+server:
+  port: 8080 # puerta de entrada principal
+
+spring:
+  application:
+    name: api-gateway
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:relatos_secret_password}
+  cloud:
+    gateway:
+      server:
+        webflux:
+          discovery:
+            locator:
+              enabled: true
+              lower-case-service-id: true
+          # --- AQUÍ DEFINIMOS LAS RUTAS EXPLÍCITAS (CRITERIO 7) ---
+          routes:
+            - id: ms-users-auth
+              uri: lb://users
+              predicates:
+                - Path=/auth/**
+              filters:
+                - RewritePath=/auth/(?<segment>.*), /api/v1/auth/$\{segment}
+
+            - id: ms-catalogue
+              uri: lb://catalogue # "lb" significa "load balanced", es decir, que usará Eureka para encontrar instancias disponibles
+              predicates:
+                - Path=/catalogo/**
+              filters:
+                # Esto quita "/catalogo" y deja el resto para que el microservicio lo entienda
+                - RewritePath=/catalogo/(?<segment>.*), /$\{segment}
+
+            - id: ms-orders
+              uri: lb://orders
+              predicates:
+                - Path=/ordenes/**
+              filters:
+                # Esto quita "/orders" y deja el resto para que el microservicio lo entienda
+                - RewritePath=/ordenes/(?<segment>.*), /$\{segment}
+
+          # Configuración de CORS (¡Muy útil para el futuro Front-end!)
+          globalcors:
+            cors-configurations:
+              '[/**]':
+                allowedOrigins: "*"
+                allowedHeaders: "*"
+                allowedMethods:
+                  - GET
+                  - POST
+                  - PUT
+                  - DELETE
+                  - PATCH
+
+eureka:
+  instance:
+    hostname: localhost
+    preferIpAddress: true
+  client:
+    registerWithEureka: true
+    fetchRegistry: true
+    serviceUrl:
+      defaultZone: http://localhost:8761/eureka/
+
+# Esto permite ver las rutas en http://localhost:8080/actuator/gateway/routes
+management:
+  endpoints:
+    web:
+      exposure:
+        include: gateway,health,info

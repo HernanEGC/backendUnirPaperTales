@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # Servidor MySQL 1: Para el Microservicio de Catálogo
+  db-catalogo:
+    image: mysql:8.0
+    container_name: dwfs-catalogo-db
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: db_catalogo
+    ports:
+      - "3306:3306" # Puerto estándar
+    volumes:
+      - catalogo_vol:/var/lib/mysql
+
+  # Servidor MySQL 2: Para el Microservicio de Órdenes
+  db-ordenes:
+    image: mysql:8.0
+    container_name: dwfs-ordenes-db
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: db_ordenes
+    ports:
+      - "3307:3306" # AQUÍ mapeamos el 3307 para que no choque con el de arriba
+    volumes:
+      - ordenes_vol:/var/lib/mysql
+
+  # Servidor MySQL 2: Para el Microservicio de Usuarios
+  db-users:
+    image: mysql:8.0
+    container_name: dwfs-users-db
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: db_users
+    ports:
+      - "3308:3306" # AQUÍ mapeamos el 3307 para que no choque con el de arriba
+    volumes:
+      - users_vol:/var/lib/mysql
+
+  rp-redis:
+    image: redis:7.2-alpine
+    container_name: relatos-papel-redis
+    command: redis-server --requirepass relatos_secret_password
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_vol:/data
+
+
+volumes:
+  catalogo_vol:
+  ordenes_vol:
+  users_vol:
+  redis_vol:
