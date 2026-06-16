@@ -1,0 +1,1446 @@
+Vamos a desarrollar a fondo el Bloque de Autenticación y Autorización (Criterio 1 - 40%), el cual equivale a 4 puntos directos de la nota de tu Actividad 3.
+
+Para cumplir estrictamente con el enunciado de la UNIR, implementaremos el patrón Phantom Token (Token Fantasma). Este patrón divide la seguridad en dos niveles:
+
+Hacia el exterior (Frontend SPA en React): Se expone un Token Opaco (un string aleatorio/UUID sin significado semántico), impidiendo que se filtren los roles o datos del usuario en el navegador del cliente.
+
+Hacia el interior (Malla de Microservicios): El API Gateway intercepta ese Token Opaco, lo valida de forma ultra veloz consultando una caché en memoria (Redis) y lo intercambia por un JWT firmado criptográficamente (El Fantasma). Este JWT se inyecta en la cabecera HTTP y viaja hacia los microservicios (book-catalogue, orders-service, etc.), permitiéndoles validar de manera local y sin estado los roles y claims.
+
+🧱 Arquitectura de Persistencia Efímera (Docker Compose para Redis)
+Para soportar la caché de tokens en el Gateway, añade el servicio de Redis a tu archivo de orquestación local. Obligatoriamente le configuramos una contraseña para cumplir con las directrices de producción explicadas por el profesor:
+
+YAML
+version: '3.8'
+
+services:
+  rp-redis:
+    image: redis:7.2-alpine
+    container_name: relatos-papel-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass relatos_secret_password
+    networks:
+      - rp-network
+
+networks:
+  rp-network:
+    driver: bridge
+⬢ A. Desarrollo en el Servidor de Identidad: users-service
+Este microservicio se conecta a una base de datos relacional para verificar las credenciales del lector o administrador, genera el JWT (usando cifrado asimétrico), crea el Token Opaco y guarda la relación en Redis con un tiempo de vida (TTL) controlado.
+
+1. Configuración de dependencias (pom.xml):
+Asegúrate de tener el conector de Redis y el soporte de seguridad web:
+
+XML
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+</dependency>
+2. Lógica del Generador de Tokens (TokenService.java):
+Este componente se encarga de fabricar ambas estructuras de tokens y empaquetarlas en Redis.
+
+Java
+package com.unir.users.service;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.security.oauth2.jwt.JwtClaimsSet;
+import org.springframework.security.oauth2.jwt.JwtEncoder;
+import org.springframework.security.oauth2.jwt.JwtEncoderParameters;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+@Service
+@RequiredArgsConstructor
+public class TokenService {
+
+    private final StringRedisTemplate redisTemplate; // Cliente de operaciones para Redis
+    private final JwtEncoder jwtEncoder; // Codificador inyectado con llaves asimétricas RSA
+
+    public String generatePhantomTokenPattern(String username, String role, Long userId) {
+        Instant now = Instant.now();
+
+        // 1. Crear el JWT Interno (Estructura pesada con metadatos y roles)
+        JwtClaimsSet claims = JwtClaimsSet.builder()
+                .issuer("relatos-papel-auth")
+                .issuedAt(now)
+                .expiresAt(now.plus(5, ChronoUnit.MINUTES)) // Tiempo corto de vida útil
+                .subject(userId.toString())
+                .claim("username", username)
+                .claim("roles", List.of(role)) // Colección de roles, ej: "ROLE_LECTOR"
+                .build();
+
+        String internalJwt = this.jwtEncoder.encode(JwtEncoderParameters.from(claims)).getTokenValue();
+
+        // 2. Crear el Token Opaco Exterior (Referencia ciega tipo UUID sin semántica)
+        String opaqueToken = "rp_opaque_" + UUID.randomUUID().toString().replace("-", "");
+
+        // 3. Persistir en la base de datos de Redis en RAM con TTL idéntico (300 segundos)
+        // Estructura en Redis -> Key: rp_opaque_xxxx... | Value: eyJhbGciOiJSUzI1Ni... (JWT)
+        redisTemplate.opsForValue().set(opaqueToken, internalJwt, 5, TimeUnit.MINUTES);
+
+        // Retornamos únicamente el Token Opaco al controlador para que viaje al Frontend React
+        return opaqueToken;
+    }
+}
+3. Endpoint de Autenticación (AuthController.java):
+Java
+package com.unir.users.controller;
+
+import com.unir.users.dto.LoginRequest;
+import com.unir.users.dto.AuthResponse;
+import com.unir.users.service.TokenService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private final TokenService tokenService;
+
+    @PostMapping("/login")
+    public ResponseEntity<AuthResponse> login(@RequestBody LoginRequest loginRequest) {
+        // NOTA DE INGENIERÍA: Aquí se debe validar el usuario/password contra la Base de Datos.
+        // Simulamos la validación para concentrarnos en la emisión del patrón Phantom Token.
+        if ("lector@unir.com".equals(loginRequest.getEmail()) && "password123".equals(loginRequest.getPassword())) {
+
+            // Emitimos el token opaco asociándole el Rol correspondiente del Dominio
+            String externalToken = tokenService.generatePhantomTokenPattern(loginRequest.getEmail(), "ROLE_LECTOR", 42L);
+            return ResponseEntity.ok(new AuthResponse(externalToken, "Bearer", 300L));
+        }
+
+        return ResponseEntity.status(401).build(); // Credenciales inválidas
+    }
+}
+🛡️ B. Desarrollo en el API Gateway: spring-cloud-gateway
+El Gateway se sitúa en el perímetro de la infraestructura. interceptará todas las llamadas entrantes destinadas a los microservicios internos.
+
+1. Configuración de Filtros y Rutas (application.yml):
+Configuramos la conexión hacia el contenedor seguro de Redis y el mapeo de enrutamiento dinámico guiado por nombres lógicos:
+
+YAML
+spring:
+  application:
+    name: api-gateway
+  cloud:
+    gateway:
+      routes:
+        # Enrutamiento hacia el catálogo de libros
+        - id: book-catalogue-service
+          uri: lb://book-catalogue
+          predicates:
+            - Path=/api/v1/books/**
+
+        # Enrutamiento hacia el microservicio de usuarios (Público para Login)
+        - id: users-service-public
+          uri: lb://users-service
+          predicates:
+            - Path=/api/v1/auth/**
+
+  # Conexión cifrada/autenticada con el contenedor de Redis
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password: relatos_secret_password
+2. Filtro de Intercambio de Tokens (PhantomTokenGatewayFilter.java):
+Este componente automatiza de forma transparente la sustitución del token de cara al backend interno.
+
+Java
+package com.unir.gateway.filter;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.cloud.gateway.filter.GatewayFilterChain;
+import org.springframework.cloud.gateway.filter.GlobalFilter;
+import org.springframework.core.Ordered;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.stereotype.Component;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+@Component
+@RequiredArgsConstructor
+public class PhantomTokenGatewayFilter implements GlobalFilter, Ordered {
+
+    private final StringRedisTemplate redisTemplate; // Consultas directas a Redis en RAM
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        ServerHttpRequest request = exchange.getRequest();
+        String path = request.getURI().getPath();
+
+        // 1. Excluir endpoints públicos de autenticación para evitar bucles infinitos
+        if (path.startsWith("/api/v1/auth/")) {
+            return chain.filter(exchange);
+        }
+
+        // 2. Extraer la cabecera normalizada de autorización HTTP
+        String authHeader = request.getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            return onError(exchange, HttpStatus.UNAUTHORIZED); // Petición no identificada
+        }
+
+        String externalOpaqueToken = authHeader.substring(7);
+
+        // 3. Golpe de resolución asíncrona a la caché en memoria de Redis
+        String internalJwt = redisTemplate.opsForValue().get(externalOpaqueToken);
+
+        if (internalJwt == null) {
+            // Si el token expiró en Redis o no existe, se rechaza en el perímetro de forma instantánea
+            return onError(exchange, HttpStatus.UNAUTHORIZED);
+        }
+
+        // 4. PASO CLAVE: Sobrescribir la cabecera mutando la petición.
+        // Eliminamos el token opaco e inyectamos el JWT real en la cabecera 'Authorization' hacia los microservicios internos.
+        ServerHttpRequest mutatedRequest = request.mutate()
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + internalJwt)
+                .build();
+
+        return chain.filter(exchange.mutate().request(mutatedRequest).build());
+    }
+
+    private Mono<Void> Mono<Void> onError(ServerWebExchange exchange, HttpStatus status) {
+        ServerHttpResponse response = exchange.getResponse();
+        response.setStatusCode(status);
+        return response.setComplete();
+    }
+
+    @Override
+    public int getOrder() {
+        return -1; // Máxima precedencia de ejecución en la pila de filtros
+    }
+}
+🍃 C. Consumo y Validación de Grano Fino en los Microservicios (Ej: book-catalogue)
+Gracias al filtro perimetral del Gateway, el microservicio de negocio no tiene idea de la existencia del Token Opaco; él recibe un JWT tradicional firmado de forma limpia. Activamos Spring Security localmente para validar los claims y autorizar por métodos.
+
+1. Configuración de Seguridad Local (ResourceServerConfig.java):
+Java
+package com.unir.products.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter;
+import org.springframework.security.oauth2.server.resource.authentication.JwtGrantedAuthoritiesConverter;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity // Habilita anotaciones fuertes como @PreAuthorize
+public class ResourceServerConfig {
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable()) // Stateless API
+            .authorizeHttpRequests(auth -> auth
+                .anyRequest().authenticated() // Toda petición que entra debe traer un JWT válido
+            )
+            .oauth2ResourceServer(oauth2 -> oauth2.jwt(jwt ->
+                jwt.jwtAuthenticationConverter(jwtAuthenticationConverter())
+            ));
+        return http.build();
+    }
+
+    // Extractor de Autoridades: Transforma el claim custom "roles" del JWT al formato de Spring
+    private JwtAuthenticationConverter jwtAuthenticationConverter() {
+        JwtGrantedAuthoritiesConverter authoritiesConverter = new JwtGrantedAuthoritiesConverter();
+        authoritiesConverter.setAuthoritiesClaimName("roles");
+        authoritiesConverter.setAuthorityPrefix(""); // Evitamos duplicar prefijos redundantes
+
+        JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+        converter.setJwtGrantedAuthoritiesConverter(authoritiesConverter);
+        return converter;
+    }
+}
+2. Autorización Quirúrgica de Métodos (BookController.java):
+Java
+package com.unir.products.controller;
+
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/books")
+public class BookController {
+
+    // Operación consultiva de lectura (Permitida para Lectores y Administradores)
+    @GetMapping("/{id}")
+    @PreAuthorize("hasAnyAuthority('ROLE_LECTOR', 'ROLE_ADMIN')")
+    public String getBookDetails(@PathVariable Long id) {
+        return "Detalles del libro de Relatos de papel con ID: " + id;
+    }
+
+    // Operación crítica de escritura/modificación del catálogo (Exclusiva para Administradores)
+    @PostMapping
+    @PreAuthorize("hasAuthority('ROLE_ADMIN')")
+    public String addNewBookToCatalog() {
+        return "Nuevo manuscrito indexado exitosamente por el administrador.";
+    }
+}
+🚨 Alerta de Examen / Trampa Común para la Memoria
+En tu memoria técnica y explicación del vídeo obligatoria (Criterios 6 y 7), debes dejar claro este argumento arquitectónico:
+
+"Implementamos el patrón Phantom Token para cumplir con el principio de Defensa en Profundidad. Si usáramos tokens opacos de extremo a extremo, saturaríamos el sistema con llamadas de introspección de red síncronas contra el servidor de usuarios. Al convertirlos en el Gateway en JWTs internos, permitimos que la malla de microservicios valide los permisos localmente en memoria sin golpear bases de datos, garantizando una latencia constante de O(1) en cada petición."
+
+Con estos componentes construidos, el Criterio 1 de tu Actividad 3 queda totalmente cubierto en el lado del backend. ¿Dime si deseas que configuremos ahora los servicios en el frontend de React para enviar este token opaco o si pasamos al punto 3 (RabbitMQ e hilos de eventos asíncronos)?
+
+=====================================================================
+ADAPTACIÓN REAL PARA ESTE PROYECTO: React_RelatosPapel
+=====================================================================
+
+He revisado la estructura actual del proyecto antes de aplicar esta guía y estas son las conclusiones importantes:
+
+1) Sí existe la carpeta `ms-users`, pero por ahora solo contiene este archivo `act3_login.txt`.
+2) El `api-gateway` ya está montado con Spring Cloud Gateway + Eureka y usa WebFlux.
+3) Los microservicios existentes se registran con estos nombres reales:
+   - `catalogue`
+   - `orders`
+4) En `infra/docker-compose.yml` ya existe `db-users`, por lo que la base para usuarios ya está prevista.
+5) Aún NO existe Redis en `docker-compose.yml`, así que el patrón Phantom Token todavía no se puede aplicar.
+
+IMPORTANTE: La guía anterior es buena como arquitectura, pero NO se debe copiar literalmente en este proyecto porque hay que adaptar nombres, rutas, dependencias y el estilo reactivo del Gateway.
+
+=====================================================================
+DECISIÓN ARQUITECTÓNICA RECOMENDADA PARA ESTE REPO
+=====================================================================
+
+Recomendación para mantener coherencia con tu arquitectura actual:
+
+- Nuevo microservicio: `ms-users`
+- Nombre de aplicación en Eureka: `users`
+- Base de datos: MySQL en el contenedor `db-users`
+- Caché de tokens opacos: Redis
+- Token externo para React: opaco
+- Token interno para microservicios: JWT firmado
+- Punto público de login: `POST /auth/login` en el Gateway
+- Endpoint interno real en `ms-users`: `POST /api/v1/auth/login`
+
+De esta forma:
+
+- React nunca verá el JWT interno.
+- El Gateway resolverá el token opaco en Redis.
+- `ms-catalogue` y `ms-orders` recibirán un JWT estándar y podrán validar roles localmente.
+
+=====================================================================
+CORRECCIONES OBLIGATORIAS SOBRE LA GUÍA ORIGINAL
+=====================================================================
+
+Antes de implementar, corrige mentalmente estos puntos de la guía anterior:
+
+1) En el Gateway NO conviene usar `StringRedisTemplate` de forma bloqueante.
+   Como tu Gateway usa WebFlux, lo correcto es usar `ReactiveStringRedisTemplate`.
+
+2) La firma de este método en la guía original está mal escrita:
+   `private Mono<Void> Mono<Void> onError(...)`
+   Debe ser:
+   `private Mono<Void> onError(...)`
+
+3) Los nombres de servicio del ejemplo no coinciden con este proyecto.
+   En este repo debes trabajar con:
+   - `lb://catalogue`
+   - `lb://orders`
+   - `lb://users`
+
+4) Las rutas del Gateway actuales son externas (`/catalogo/**` y `/ordenes/**`) y hacen rewrite.
+   La autenticación debe seguir la misma filosofía para no romper el diseño actual.
+
+5) En `ms-users` no necesitas configurar `oauth2-resource-server` para el login si solo vas a emitir JWT.
+   Lo que sí necesitas seguro es soporte JOSE/JWT para firmarlos.
+
+=====================================================================
+PASO A PASO RECOMENDADO PARA IMPLEMENTARLO
+=====================================================================
+
+PASO 1. Crear el microservicio `ms-users`
+---------------------------------------------------------------------
+
+Debes crear un proyecto Spring Boot nuevo dentro de `ms-users` con una estructura parecida a la de `ms-catalogue` y `ms-orders`.
+
+Paquetes sugeridos:
+
+- `com.unir.papertales.users`
+- `com.unir.papertales.users.controller`
+- `com.unir.papertales.users.service`
+- `com.unir.papertales.users.repository`
+- `com.unir.papertales.users.model`
+- `com.unir.papertales.users.config`
+- `com.unir.papertales.users.dto`
+
+Dependencias recomendadas en `ms-users/pom.xml`:
+
+- `spring-cloud-starter-netflix-eureka-client`
+- `spring-boot-starter-webmvc`
+- `spring-boot-starter-data-jpa`
+- `spring-boot-starter-validation`
+- `spring-boot-starter-security`
+- `spring-boot-starter-data-redis`
+- `spring-security-oauth2-jose`
+- `mysql-connector-j`
+- `lombok`
+- `spring-boot-starter-test`
+
+Nota:
+No copies aquí `spring-boot-starter-oauth2-resource-server` salvo que luego quieras proteger endpoints del propio `ms-users` con JWT. Para el login puro, emitir JWT con JOSE es suficiente.
+
+---------------------------------------------------------------------
+PASO 2. Configurar `ms-users/src/main/resources/application.yml`
+---------------------------------------------------------------------
+
+Configura al menos estos bloques:
+
+- `server.port`: por ejemplo `8083`
+- `spring.application.name`: `users`
+- `spring.datasource`: apuntando a MySQL puerto `3308`
+- `spring.jpa`
+- `spring.data.redis`
+- `eureka.client.service-url.defaultZone`
+
+Valores esperados según este proyecto:
+
+- MySQL usuarios: `jdbc:mysql://localhost:3308/db_users`
+- Redis: `localhost:6379`
+- Eureka: `http://localhost:8761/eureka`
+
+También te conviene meter propiedades para JWT, por ejemplo:
+
+- `security.jwt.private-key-path`
+- `security.jwt.public-key-path`
+- `security.jwt.ttl-seconds=300`
+
+---------------------------------------------------------------------
+PASO 3. Añadir Redis a `infra/docker-compose.yml`
+---------------------------------------------------------------------
+
+Actualmente tu `docker-compose.yml` solo contempla MySQL. Debes añadir un servicio Redis como soporte del token opaco.
+
+Recomendación:
+
+- servicio: `rp-redis`
+- imagen: `redis:7.2-alpine`
+- puerto: `6379:6379`
+- contraseña: `relatos_secret_password`
+
+Además, añade un volumen si quieres persistencia ligera, aunque para un entorno de desarrollo no es estrictamente obligatorio.
+
+Objetivo de este paso:
+
+- guardar la relación `opaqueToken -> internalJwt`
+- dejar que el token expire solo por TTL
+
+---------------------------------------------------------------------
+PASO 4. Modelar usuarios en base de datos
+---------------------------------------------------------------------
+
+En `ms-users` necesitas una tabla mínima de usuarios.
+
+Modelo mínimo recomendado:
+
+- `id`
+- `email`
+- `password`
+- `role`
+- `enabled`
+
+Roles iniciales sugeridos:
+
+- `ROLE_LECTOR`
+- `ROLE_ADMIN`
+
+La contraseña debe almacenarse con `BCryptPasswordEncoder`, no en texto plano.
+
+Para la actividad, una versión mínima es suficiente si incluye:
+
+- entidad JPA
+- repositorio `findByEmail(...)`
+- datos semilla en `db/ejemplos.sql`
+
+---------------------------------------------------------------------
+PASO 5. Crear DTOs de autenticación
+---------------------------------------------------------------------
+
+DTOs mínimos sugeridos:
+
+- `LoginRequest`
+  - `email`
+  - `password`
+
+- `AuthResponse`
+  - `accessToken`
+  - `tokenType`
+  - `expiresIn`
+
+Opcional:
+
+- `UserInfoResponse`
+  - `id`
+  - `email`
+  - `role`
+
+---------------------------------------------------------------------
+PASO 6. Implementar validación de credenciales
+---------------------------------------------------------------------
+
+En `ms-users` crea un servicio que haga este flujo:
+
+1) Busca el usuario por email.
+2) Comprueba que exista y esté activo.
+3) Valida la contraseña con BCrypt.
+4) Si es correcta, genera el JWT interno.
+5) Genera el token opaco externo.
+6) Guarda `opaqueToken -> jwt` en Redis con TTL.
+7) Devuelve al frontend solo el token opaco.
+
+Muy importante:
+
+- El frontend NO debe recibir el JWT interno.
+- Redis debe guardar el JWT usando el token opaco como clave.
+
+---------------------------------------------------------------------
+PASO 7. Implementar la firma del JWT interno
+---------------------------------------------------------------------
+
+La guía original propone RSA y es una buena decisión para explicarlo en la memoria.
+
+Claims recomendados del JWT interno:
+
+- `iss`: `relatos-papel-auth`
+- `sub`: id del usuario
+- `username`: email
+- `roles`: lista de roles
+- `iat`
+- `exp`
+
+TTL recomendado:
+
+- `5 minutos` para la actividad
+
+Recomendación técnica:
+
+- Guarda una clave privada para firmar en `ms-users`
+- Distribuye la clave pública a `ms-catalogue` y `ms-orders` para validación
+
+Si lo explicas en la memoria, puedes justificarlo así:
+
+- firma privada solo en `ms-users`
+- validación pública en microservicios
+- no hace falta compartir secretos simétricos entre todos los servicios
+
+---------------------------------------------------------------------
+PASO 8. Crear el controlador de login en `ms-users`
+---------------------------------------------------------------------
+
+Endpoint interno recomendado:
+
+- `POST /api/v1/auth/login`
+
+Comportamiento esperado:
+
+- si credenciales correctas: `200 OK` con `AuthResponse`
+- si incorrectas: `401 Unauthorized`
+
+Opcional pero recomendable:
+
+- `POST /api/v1/auth/logout`
+  - recibe el token opaco
+  - elimina la entrada de Redis
+
+Esto queda muy bien para la entrega porque demuestra cierre de sesión real del token opaco.
+
+---------------------------------------------------------------------
+PASO 9. Adaptar el Gateway a tu proyecto real
+---------------------------------------------------------------------
+
+En `api-gateway/pom.xml` añade soporte Redis reactivo.
+
+Recomendación:
+
+- `spring-boot-starter-data-redis-reactive`
+
+Después, en `api-gateway/src/main/resources/application.yml`:
+
+1) añade la conexión Redis
+2) añade una ruta pública hacia `users`
+3) mantén las rutas actuales de `catalogue` y `orders`
+
+Ruta nueva recomendada:
+
+- externa: `/auth/**`
+- destino: `lb://users`
+- rewrite: `/api/v1/auth/**`
+
+Ejemplo conceptual de resultado:
+
+- `POST /auth/login` entra al Gateway
+- el Gateway lo envía a `users`
+- `users` responde con token opaco
+
+---------------------------------------------------------------------
+PASO 10. Crear el filtro Phantom Token en el Gateway
+---------------------------------------------------------------------
+
+Este es el núcleo de la solución.
+
+Responsabilidad del filtro:
+
+1) Dejar pasar rutas públicas como `/auth/**`
+2) Leer `Authorization: Bearer <opaqueToken>`
+3) Resolver el token en Redis
+4) Si existe, sustituirlo por el JWT interno
+5) Reenviar la petición al microservicio de negocio
+6) Si no existe, devolver `401`
+
+IMPORTANTE para este proyecto:
+
+- Como el Gateway es WebFlux, el filtro debe ser NO BLOQUEANTE.
+- Usa `ReactiveStringRedisTemplate`.
+- No metas consultas bloqueantes a Redis dentro del filtro.
+
+Rutas que conviene excluir del filtro:
+
+- `/auth/**`
+- `/actuator/**`
+
+Opcional según tu estrategia:
+
+- permitir algunos GET públicos de catálogo
+- proteger escritura y órdenes
+
+---------------------------------------------------------------------
+PASO 11. Proteger `ms-catalogue`
+---------------------------------------------------------------------
+
+En `ms-catalogue/pom.xml` añade:
+
+- `spring-boot-starter-security`
+- `spring-boot-starter-oauth2-resource-server`
+
+Luego crea configuración de seguridad para:
+
+1) exigir JWT válido en las peticiones
+2) leer el claim `roles`
+3) mapearlo a authorities de Spring
+
+Sobre tu código actual:
+
+- tus endpoints reales están en `/api/v1/books`
+- también existen `/api/v2/books` y `/api/v3/books`
+
+Autorización sugerida para la actividad:
+
+- GET libros: `ROLE_LECTOR` o `ROLE_ADMIN`
+- POST/PUT/DELETE libros: `ROLE_ADMIN`
+
+---------------------------------------------------------------------
+PASO 12. Proteger `ms-orders`
+---------------------------------------------------------------------
+
+En `ms-orders/pom.xml` añade igualmente:
+
+- `spring-boot-starter-security`
+- `spring-boot-starter-oauth2-resource-server`
+
+Tus endpoints actuales incluyen:
+
+- `/api/v1/orders`
+- `/api/v1/orders/{orderId}`
+- `/api/v1/orders/user/{userId}`
+- `/api/v1/users`
+
+Sugerencia de autorización mínima:
+
+- consultar órdenes propias: `ROLE_LECTOR` y `ROLE_ADMIN`
+- crear/modificar/eliminar órdenes: según lógica del ejercicio, como mínimo usuarios autenticados
+- operaciones administrativas de usuarios: `ROLE_ADMIN`
+
+OJO:
+Si una orden está asociada a un usuario concreto, lo ideal es que el servicio también compare el `sub` del JWT con el `userId` solicitado. Eso ya sería autorización a nivel de recurso, no solo por rol.
+
+---------------------------------------------------------------------
+PASO 13. Mantener coherencia de rutas con el Gateway actual
+---------------------------------------------------------------------
+
+Tu Gateway ahora publica:
+
+- `/catalogo/**`
+- `/ordenes/**`
+
+Mi recomendación es no romper esto. Por tanto, el consumo quedaría así:
+
+- Login: `POST /auth/login`
+- Catálogo: `GET /catalogo/api/v1/books`
+- Órdenes: `GET /ordenes/api/v1/orders`
+
+Y el Gateway internamente reescribe hacia:
+
+- `users` -> `/api/v1/auth/**`
+- `catalogue` -> `/api/v1/**`
+- `orders` -> `/api/v1/**`
+
+---------------------------------------------------------------------
+PASO 14. Preparar datos de prueba para la demo
+---------------------------------------------------------------------
+
+Necesitas al menos dos usuarios en `ms-users`:
+
+1) lector
+   - email: `lector@unir.com`
+   - rol: `ROLE_LECTOR`
+
+2) administrador
+   - email: `admin@unir.com`
+   - rol: `ROLE_ADMIN`
+
+La contraseña debe estar en BCrypt dentro de la base de datos.
+
+Con esto podrás demostrar:
+
+- que ambos pueden hacer login
+- que ambos pueden leer catálogo
+- que solo admin puede crear o modificar libros
+
+---------------------------------------------------------------------
+PASO 15. Secuencia de prueba recomendada
+---------------------------------------------------------------------
+
+Prueba funcional completa que deberías poder enseñar:
+
+1) Levantar MySQL + Redis
+2) Levantar Eureka
+3) Levantar `ms-users`
+4) Levantar `ms-catalogue`
+5) Levantar `ms-orders`
+6) Levantar `api-gateway`
+7) Hacer login por `POST /auth/login`
+8) Copiar el token opaco devuelto
+9) Consumir `/catalogo/api/v1/books` con `Authorization: Bearer <opaqueToken>`
+10) Verificar que el Gateway lo cambia por JWT interno
+11) Probar una operación de admin con usuario lector y comprobar `403`
+12) Repetir con admin y comprobar acceso permitido
+
+Esto es exactamente el flujo que más valor te da para defender la actividad.
+
+---------------------------------------------------------------------
+PASO 16. Qué explicar en la memoria técnica
+---------------------------------------------------------------------
+
+Puntos que conviene dejar muy claros:
+
+1) El frontend no recibe roles ni claims sensibles.
+2) El token externo es opaco y no revela información.
+3) El Gateway actúa como punto de intercambio de tokens.
+4) Redis evita introspecciones repetidas y reduce latencia.
+5) Los microservicios validan el JWT de forma local y stateless.
+6) La autorización fina se hace por roles y, si da tiempo, por recurso.
+
+Frase útil para la memoria:
+
+"Se implementa el patrón Phantom Token para separar la seguridad externa de la interna. El cliente opera con un token opaco sin semántica, mientras que el API Gateway lo intercambia por un JWT interno firmado, permitiendo que los microservicios validen permisos localmente sin depender de introspecciones remotas en cada petición."
+
+=====================================================================
+ORDEN DE IMPLEMENTACIÓN RECOMENDADO
+=====================================================================
+
+Si quieres avanzar sin bloquearte, sigue este orden exacto:
+
+1) Añadir Redis en `infra/docker-compose.yml`
+2) Crear esqueleto de `ms-users`
+3) Configurar conexión MySQL + Eureka + Redis en `ms-users`
+4) Crear entidad usuario + repositorio + datos semilla
+5) Implementar BCrypt + login
+6) Implementar emisión de JWT + token opaco
+7) Adaptar ruta pública del Gateway hacia `users`
+8) Implementar filtro Phantom Token reactivo
+9) Añadir seguridad JWT en `ms-catalogue`
+10) Añadir seguridad JWT en `ms-orders`
+11) Probar flujo lector
+12) Probar flujo admin
+13) Documentar capturas y explicación en memoria
+
+=====================================================================
+RECOMENDACIÓN FINAL PARA ESTE PROYECTO
+=====================================================================
+
+La mejor forma de hacerlo en tu caso es esta:
+
+- usar `ms-users` como servidor de autenticación
+- usar Redis solo en `ms-users` y `api-gateway`
+- mantener `ms-catalogue` y `ms-orders` como resource servers
+- conservar las rutas externas actuales del Gateway
+- no exponer nunca el JWT interno al frontend React
+
+Si continúo con esta actividad, el siguiente paso natural es crear ya la base del microservicio `ms-users` y adaptar `api-gateway` para que todo quede listo para pruebas reales.
+
+=====================================================================
+MAPA EXACTO DE ARCHIVOS A CREAR O MODIFICAR EN ESTE REPO
+=====================================================================
+
+Para no perderte durante la implementación, este es el mapa real de trabajo por archivo.
+
+---------------------------------------------------------------------
+A) Archivos nuevos esperados dentro de `ms-users`
+---------------------------------------------------------------------
+
+1) `ms-users/pom.xml`
+   - Dependencias base del nuevo microservicio.
+
+2) `ms-users/src/main/java/com/unir/papertales/users/UsersApplication.java`
+   - Clase principal de arranque.
+
+3) `ms-users/src/main/java/com/unir/papertales/users/controller/AuthController.java`
+   - Endpoint `POST /api/v1/auth/login`.
+   - Opcional: `POST /api/v1/auth/logout`.
+
+4) `ms-users/src/main/java/com/unir/papertales/users/service/AuthService.java`
+   - Orquesta validación de usuario y login.
+
+5) `ms-users/src/main/java/com/unir/papertales/users/service/TokenService.java`
+   - Genera JWT interno.
+   - Genera token opaco.
+   - Guarda relación en Redis.
+
+6) `ms-users/src/main/java/com/unir/papertales/users/config/SecurityConfig.java`
+   - Configuración mínima de seguridad.
+   - Permitir `/api/v1/auth/**`.
+   - Desactivar CSRF si trabajas como API stateless.
+
+7) `ms-users/src/main/java/com/unir/papertales/users/config/JwtKeyConfig.java`
+   - Carga de claves RSA.
+   - Bean para encoder JWT.
+
+8) `ms-users/src/main/java/com/unir/papertales/users/model/User.java`
+   - Entidad JPA del usuario autenticable.
+
+9) `ms-users/src/main/java/com/unir/papertales/users/repository/UserRepository.java`
+   - Consulta por email.
+
+10) `ms-users/src/main/java/com/unir/papertales/users/dto/LoginRequest.java`
+11) `ms-users/src/main/java/com/unir/papertales/users/dto/AuthResponse.java`
+
+12) `ms-users/src/main/resources/application.yml`
+    - Configuración de puerto, MySQL, Redis, Eureka y JWT.
+
+13) `ms-users/src/main/resources/db/schema.sql`
+    - Estructura de tabla de usuarios.
+
+14) `ms-users/src/main/resources/db/ejemplos.sql`
+    - Usuarios de prueba con password BCrypt.
+
+15) `ms-users/src/main/resources/keys/private.pem`
+16) `ms-users/src/main/resources/keys/public.pem`
+    - Claves para firma y validación.
+
+---------------------------------------------------------------------
+B) Archivos a modificar en `api-gateway`
+---------------------------------------------------------------------
+
+1) `api-gateway/pom.xml`
+   - Añadir Redis reactivo.
+
+2) `api-gateway/src/main/resources/application.yml`
+   - Añadir configuración Redis.
+   - Añadir ruta pública `/auth/**` hacia `users`.
+   - Mantener rutas actuales `/catalogo/**` y `/ordenes/**`.
+
+3) `api-gateway/src/main/java/com/unir/gateway/filter/PhantomTokenGatewayFilter.java`
+   - Nuevo filtro global.
+   - Resolver token opaco desde Redis.
+   - Sustituirlo por JWT interno.
+
+4) Opcional: `api-gateway/src/main/java/com/unir/gateway/config/RedisConfig.java`
+   - Solo si necesitas personalizar beans reactivos de Redis.
+
+---------------------------------------------------------------------
+C) Archivos a modificar en `ms-catalogue`
+---------------------------------------------------------------------
+
+1) `ms-catalogue/pom.xml`
+   - Añadir seguridad y resource server.
+
+2) `ms-catalogue/src/main/resources/application.yml`
+   - Configurar la validación del JWT.
+   - Referenciar clave pública o ubicación equivalente.
+
+3) `ms-catalogue/src/main/java/com/unir/papertales/catalogue/config/ResourceServerConfig.java`
+   - Proteger endpoints.
+   - Mapear claim `roles`.
+
+4) `ms-catalogue/src/main/java/com/unir/papertales/catalogue/controller/BooksController.java`
+   - Añadir `@PreAuthorize` en operaciones según rol.
+
+5) Si quieres consistencia completa:
+   - `BooksControllerGetWithPredicate.java`
+   - `BooksControllerGetWithPredicateAndPagination.java`
+   porque también exponen endpoints de lectura.
+
+---------------------------------------------------------------------
+D) Archivos a modificar en `ms-orders`
+---------------------------------------------------------------------
+
+1) `ms-orders/pom.xml`
+   - Añadir seguridad y resource server.
+
+2) `ms-orders/src/main/resources/application.yml`
+   - Configurar validación JWT.
+
+3) `ms-orders/src/main/java/com/unir/papertales/orders/config/ResourceServerConfig.java`
+   - Reglas de autorización.
+   - Mapeo de roles.
+
+4) `ms-orders/src/main/java/com/unir/papertales/orders/controller/OrdersController.java`
+   - Restringir operaciones según rol/autenticación.
+
+5) `ms-orders/src/main/java/com/unir/papertales/orders/controller/UsersController.java`
+   - Muy probablemente dejarlo solo para `ROLE_ADMIN`.
+
+6) `ms-orders/src/main/java/com/unir/papertales/orders/client/CatalogueClient.java`
+   - Punto crítico de integración interna. Ver sección especial más abajo.
+
+---------------------------------------------------------------------
+E) Archivo a modificar en infraestructura
+---------------------------------------------------------------------
+
+1) `infra/docker-compose.yml`
+   - Añadir Redis.
+   - Mantener `db-catalogo`, `db-ordenes` y `db-users`.
+
+=====================================================================
+ATENCIÓN ESPECIAL: PROBLEMA REAL ENTRE `ms-orders` Y `ms-catalogue`
+=====================================================================
+
+Este punto es MUY importante porque puede romper tu autenticación si no lo tienes en cuenta.
+
+He revisado que `ms-orders` llama directamente a `catalogue` usando `RestTemplate` con balanceo de carga:
+
+- archivo: `ms-orders/src/main/java/com/unir/papertales/orders/client/CatalogueClient.java`
+- URL usada: `http://catalogue/api/v1/books/{bookId}`
+
+Esto significa que:
+
+1) `ms-orders` NO entra al `api-gateway` para esa llamada interna.
+2) Por tanto, el patrón Phantom Token del Gateway NO participa en esa comunicación.
+3) Si proteges `ms-catalogue` con JWT, `ms-orders` tendrá que enviar también un JWT válido cuando invoque a `catalogue`.
+
+Tienes tres estrategias posibles:
+
+ESTRATEGIA A. Propagar el JWT del usuario autenticado
+------------------------------------------------------
+
+La más coherente para una práctica académica avanzada.
+
+Idea:
+
+- El usuario entra por Gateway con token opaco.
+- El Gateway lo cambia por JWT y se lo pasa a `ms-orders`.
+- `ms-orders` reutiliza ese JWT cuando llama a `catalogue`.
+
+Ventajas:
+
+- Mantienes trazabilidad del usuario real.
+- La autorización sigue siendo extremo a extremo dentro de la malla.
+
+Inconveniente:
+
+- Hay que capturar la cabecera `Authorization` y reenviarla en `CatalogueClient`.
+
+ESTRATEGIA B. Permitir comunicación de servicio a servicio con una excepción controlada
+----------------------------------------------------------------------------------------
+
+Idea:
+
+- `ms-catalogue` acepta ciertas llamadas internas desde `ms-orders` por una ruta separada o una regla especial.
+
+Ventajas:
+
+- Implementación más rápida.
+
+Inconvenientes:
+
+- Menos elegante.
+- Más difícil de justificar si te preguntan por seguridad homogénea.
+
+ESTRATEGIA C. Hacer que `ms-orders` invoque catálogo a través del Gateway
+-------------------------------------------------------------------------
+
+Idea:
+
+- En lugar de llamar a `http://catalogue/...`, llamas al Gateway.
+
+Inconvenientes:
+
+- No es lo más limpio para comunicación interna entre microservicios.
+- Puede introducir acoplamiento innecesario.
+
+RECOMENDACIÓN PARA TU ACTIVIDAD:
+--------------------------------
+
+La mejor opción para defender el diseño es la ESTRATEGIA A: propagar el JWT interno desde `ms-orders` hacia `ms-catalogue`.
+
+Eso implica que en `CatalogueClient` tendrás que:
+
+1) leer la cabecera Authorization de la petición entrante o del contexto de seguridad,
+2) copiarla en la llamada saliente hacia `catalogue`,
+3) dejar que `ms-catalogue` valide ese mismo JWT.
+
+Si no haces esto, es muy probable que `ms-orders` deje de funcionar en las llamadas internas una vez actives seguridad en catálogo.
+
+=====================================================================
+REGLAS DE AUTORIZACIÓN SUGERIDAS, YA BAJADAS A TUS ENDPOINTS REALES
+=====================================================================
+
+---------------------------------------------------------------------
+1) Para `ms-catalogue`
+---------------------------------------------------------------------
+
+Endpoints reales detectados:
+
+- `GET /api/v1/books`
+- `GET /api/v1/books/{bookId}`
+- `POST /api/v1/books`
+- `PUT /api/v1/books/{bookId}`
+- `PATCH /api/v1/books/{bookId}`
+- `DELETE /api/v1/books/{bookId}`
+
+Regla sugerida:
+
+- GET: `ROLE_LECTOR` o `ROLE_ADMIN`
+- POST/PUT/PATCH/DELETE: `ROLE_ADMIN`
+
+Si también mantienes `v2` y `v3`:
+
+- `GET /api/v2/books`
+- `GET /api/v3/books`
+
+Mi recomendación es protegerlos también como lectura autenticada.
+
+---------------------------------------------------------------------
+2) Para `ms-orders`
+---------------------------------------------------------------------
+
+Endpoints reales detectados:
+
+- `GET /api/v1/orders`
+- `GET /api/v1/orders/user/{userId}`
+- `GET /api/v1/orders/{orderId}`
+- `POST /api/v1/orders`
+- `PUT /api/v1/orders/{orderId}`
+- `PATCH /api/v1/orders/{orderId}`
+- `DELETE /api/v1/orders/{orderId}`
+
+Regla mínima sugerida:
+
+- todas las operaciones: usuario autenticado
+
+Regla mejorada:
+
+- lectura general y detalle: `ROLE_LECTOR` o `ROLE_ADMIN`
+- creación: `ROLE_LECTOR` o `ROLE_ADMIN`
+- modificación/eliminación: según dueño de la orden o admin
+
+---------------------------------------------------------------------
+3) Para `ms-orders` sobre usuarios
+---------------------------------------------------------------------
+
+Endpoints reales detectados:
+
+- `GET /api/v1/users`
+- `GET /api/v1/users/{userId}`
+- `POST /api/v1/users`
+- `PUT /api/v1/users/{userId}`
+- `PATCH /api/v1/users/{userId}`
+- `DELETE /api/v1/users/{userId}`
+
+Recomendación:
+
+- dejar todas estas operaciones solo para `ROLE_ADMIN`
+
+Justificación:
+
+- evita confusión con el nuevo `ms-users` de autenticación,
+- y te ayuda a mostrar un ejemplo claro de rol administrativo.
+
+=====================================================================
+ORDEN DE TRABAJO DETALLADO, ARCHIVO POR ARCHIVO
+=====================================================================
+
+Si yo fuera implementándolo contigo, seguiría exactamente este orden:
+
+FASE 1. Infraestructura
+-----------------------
+
+1) Modificar `infra/docker-compose.yml`
+2) Añadir Redis
+3) Verificar que no colisiona con puertos ya usados
+
+FASE 2. Nuevo microservicio de autenticación
+--------------------------------------------
+
+4) Crear `ms-users/pom.xml`
+5) Crear clase principal de arranque
+6) Crear `application.yml`
+7) Crear scripts SQL
+8) Crear entidad `User`
+9) Crear `UserRepository`
+10) Crear DTOs de login
+11) Crear `AuthService`
+12) Crear `TokenService`
+13) Crear `AuthController`
+14) Probar que `POST /api/v1/auth/login` devuelve token opaco
+
+FASE 3. Gateway
+---------------
+
+15) Añadir Redis reactivo a `api-gateway/pom.xml`
+16) Añadir ruta `/auth/**` en `api-gateway/src/main/resources/application.yml`
+17) Añadir propiedades Redis
+18) Crear `PhantomTokenGatewayFilter`
+19) Probar que `/auth/login` queda fuera del filtro
+20) Probar que `/catalogo/**` exige token
+
+FASE 4. Seguridad en catálogo
+-----------------------------
+
+21) Añadir dependencias de seguridad en `ms-catalogue/pom.xml`
+22) Crear `ResourceServerConfig`
+23) Configurar clave pública
+24) Añadir `@PreAuthorize` en `BooksController`
+25) Probar lectura con lector
+26) Probar escritura denegada con lector
+27) Probar escritura permitida con admin
+
+FASE 5. Seguridad en órdenes
+----------------------------
+
+28) Añadir dependencias de seguridad en `ms-orders/pom.xml`
+29) Crear `ResourceServerConfig`
+30) Configurar clave pública
+31) Añadir restricciones a `OrdersController`
+32) Añadir restricciones a `UsersController`
+33) Adaptar `CatalogueClient` para propagar Authorization
+34) Probar llamadas internas `orders -> catalogue`
+
+FASE 6. Validación completa
+---------------------------
+
+35) Login con lector
+36) Login con admin
+37) Acceso a catálogo con ambos
+38) Alta/modificación de libros solo con admin
+39) Crear orden con usuario autenticado
+40) Validar expiración del token opaco por TTL
+
+=====================================================================
+CHECKLIST RÁPIDO PARA NO OLVIDAR NADA
+=====================================================================
+
+[ ] `ms-users` creado y registrado en Eureka como `users`
+[ ] Redis añadido a `infra/docker-compose.yml`
+[ ] Login devuelve token opaco, no JWT
+[ ] Gateway resuelve token opaco contra Redis
+[ ] Gateway sustituye `Authorization` por JWT interno
+[ ] `ms-catalogue` valida JWT y aplica roles
+[ ] `ms-orders` valida JWT y aplica roles
+[ ] `ms-orders` propaga Authorization cuando llama a `catalogue`
+[ ] lector puede consultar
+[ ] admin puede modificar recursos restringidos
+[ ] token expirado devuelve `401`
+
+=====================================================================
+COMANDOS QUE TE CONVENDRÁN CUANDO EMPIECES A IMPLEMENTAR
+=====================================================================
+
+Puedes usar este bloque como referencia de trabajo manual cuando empieces a crear el microservicio y validar Maven:
+
+```zsh
+cd "/Users/gunnar/Documents/Desarrollo/React_RelatosPapel/infra"
+docker compose up -d
+
+cd "/Users/gunnar/Documents/Desarrollo/React_RelatosPapel/ms-users"
+mvn clean test
+
+cd "/Users/gunnar/Documents/Desarrollo/React_RelatosPapel/api-gateway"
+mvn clean test
+
+cd "/Users/gunnar/Documents/Desarrollo/React_RelatosPapel/ms-catalogue"
+mvn clean test
+
+cd "/Users/gunnar/Documents/Desarrollo/React_RelatosPapel/ms-orders"
+mvn clean test
+```
+
+OJO:
+Estos comandos son la secuencia lógica de validación, pero solo tendrán sentido después de crear y configurar realmente `ms-users` y Redis.
+
+=====================================================================
+DECISIÓN FINAL RECOMENDADA
+=====================================================================
+
+Para este proyecto concreto, el plan más sólido es:
+
+1) Crear `ms-users` como servidor de autenticación.
+2) Añadir Redis al entorno local.
+3) Exponer solo `/auth/**` como público en el Gateway.
+4) Convertir el token opaco a JWT dentro del Gateway.
+5) Proteger `ms-catalogue` y `ms-orders` como resource servers.
+6) Propagar la cabecera Authorization desde `ms-orders` a `catalogue`.
+
+Con eso tendrás una solución coherente, demostrable y defendible en memoria y vídeo.
+
+=====================================================================
+IMPLEMENTACIÓN REAL YA REALIZADA EN ESTE REPOSITORIO
+=====================================================================
+
+En esta sesión ya se ha dejado una primera implementación funcional de la base de autenticación. Dejo aquí el estado exacto para que sepas qué ya está hecho y qué falta por probar de forma integrada.
+
+---------------------------------------------------------------------
+1) Infraestructura actualizada
+---------------------------------------------------------------------
+
+Archivo modificado:
+
+- `infra/docker-compose.yml`
+
+Cambios realizados:
+
+- se añadió `rp-redis`
+- imagen: `redis:7.2-alpine`
+- puerto: `6379:6379`
+- contraseña: `relatos_secret_password`
+- volumen: `redis_vol`
+
+Validación realizada:
+
+- `docker compose config` ejecutado correctamente
+- única observación detectada: la clave `version` aparece como obsoleta en Compose moderno, pero no bloquea el uso
+
+---------------------------------------------------------------------
+2) Nuevo microservicio `ms-users` creado
+---------------------------------------------------------------------
+
+Archivos creados:
+
+- `ms-users/pom.xml`
+- `ms-users/Dockerfile`
+- `ms-users/README.md`
+- `ms-users/src/main/java/com/unir/papertales/users/UsersApplication.java`
+- `ms-users/src/main/java/com/unir/papertales/users/model/User.java`
+- `ms-users/src/main/java/com/unir/papertales/users/repository/UserRepository.java`
+- `ms-users/src/main/java/com/unir/papertales/users/dto/LoginRequest.java`
+- `ms-users/src/main/java/com/unir/papertales/users/dto/AuthResponse.java`
+- `ms-users/src/main/java/com/unir/papertales/users/controller/AuthController.java`
+- `ms-users/src/main/java/com/unir/papertales/users/service/AuthService.java`
+- `ms-users/src/main/java/com/unir/papertales/users/service/TokenService.java`
+- `ms-users/src/main/java/com/unir/papertales/users/config/SecurityConfig.java`
+- `ms-users/src/main/java/com/unir/papertales/users/config/JwtKeyConfig.java`
+- `ms-users/src/main/java/com/unir/papertales/users/config/DataInitializer.java`
+- `ms-users/src/main/resources/application.yml`
+- `ms-users/src/main/resources/db/schema.sql`
+- `ms-users/src/main/resources/keys/private.pem`
+- `ms-users/src/main/resources/keys/public.pem`
+- `ms-users/src/test/java/com/unir/papertales/users/UsersApplicationTests.java`
+- `ms-users/src/test/resources/application.yml`
+
+Decisiones tomadas en esta implementación:
+
+- el login real se expone en `POST /api/v1/auth/login`
+- el logout básico se expone en `POST /api/v1/auth/logout`
+- el token externo devuelto al cliente es opaco
+- la relación `opaqueToken -> jwt` se guarda en Redis
+- el JWT interno incluye `sub`, `username`, `roles`, `iat`, `exp`, `iss`
+- el TTL configurado es de 300 segundos
+- la carga inicial de usuarios de prueba se hace con `DataInitializer`
+
+Usuarios semilla creados automáticamente:
+
+- `lector@unir.com` / `password123`
+- `admin@unir.com` / `admin123`
+
+---------------------------------------------------------------------
+3) Claves RSA ya generadas
+---------------------------------------------------------------------
+
+Se generaron las claves en:
+
+- `ms-users/src/main/resources/keys/private.pem`
+- `ms-users/src/main/resources/keys/public.pem`
+
+Y se copió la clave pública a:
+
+- `ms-catalogue/src/main/resources/keys/public.pem`
+- `ms-orders/src/main/resources/keys/public.pem`
+
+Objetivo:
+
+- `ms-users` firma
+- `ms-catalogue` valida
+- `ms-orders` valida
+
+---------------------------------------------------------------------
+4) Gateway adaptado al patrón Phantom Token
+---------------------------------------------------------------------
+
+Archivos modificados/creados:
+
+- `api-gateway/pom.xml`
+- `api-gateway/src/main/resources/application.yml`
+- `api-gateway/src/main/java/com/unir/gateway/filter/PhantomTokenGatewayFilter.java`
+
+Cambios realizados:
+
+- se añadió Redis reactivo al Gateway
+- se añadió ruta pública `/auth/**` hacia `users`
+- se mantuvieron rutas actuales `/catalogo/**` y `/ordenes/**`
+- se creó un filtro global reactivo para:
+  - excluir `/auth/**`
+  - excluir `/actuator/**`
+  - exigir token para `/catalogo/**` y `/ordenes/**`
+  - resolver el token opaco en Redis
+  - sustituir `Authorization` por el JWT interno
+
+Nota de implementación:
+
+- se usó `ReactiveStringRedisTemplate` para mantener coherencia con WebFlux
+
+---------------------------------------------------------------------
+5) `ms-catalogue` protegido como Resource Server
+---------------------------------------------------------------------
+
+Archivos modificados/creados:
+
+- `ms-catalogue/pom.xml`
+- `ms-catalogue/src/main/resources/application.yml`
+- `ms-catalogue/src/main/java/com/unir/papertales/catalogue/config/ResourceServerConfig.java`
+- `ms-catalogue/src/main/java/com/unir/papertales/catalogue/controller/BooksController.java`
+- `ms-catalogue/src/main/java/com/unir/papertales/catalogue/controller/BooksControllerGetWithPredicate.java`
+- `ms-catalogue/src/main/java/com/unir/papertales/catalogue/controller/BooksControllerGetWithPredicateAndPagination.java`
+
+Reglas aplicadas:
+
+- lectura: `ROLE_LECTOR` o `ROLE_ADMIN`
+- escritura/modificación/borrado: `ROLE_ADMIN`
+
+JWT configurado con:
+
+- `spring.security.oauth2.resourceserver.jwt.public-key-location=classpath:keys/public.pem`
+
+---------------------------------------------------------------------
+6) `ms-orders` protegido como Resource Server
+---------------------------------------------------------------------
+
+Archivos modificados/creados:
+
+- `ms-orders/pom.xml`
+- `ms-orders/src/main/resources/application.yml`
+- `ms-orders/src/main/java/com/unir/papertales/orders/config/ResourceServerConfig.java`
+- `ms-orders/src/main/java/com/unir/papertales/orders/controller/OrdersController.java`
+- `ms-orders/src/main/java/com/unir/papertales/orders/controller/UsersController.java`
+- `ms-orders/src/main/java/com/unir/papertales/orders/client/CatalogueClient.java`
+
+Reglas aplicadas:
+
+- lectura y creación de órdenes: `ROLE_LECTOR` o `ROLE_ADMIN`
+- modificación y borrado de órdenes: `ROLE_ADMIN`
+- gestión de usuarios en este microservicio: `ROLE_ADMIN`
+
+Además, ya se implementó algo MUY importante:
+
+- `CatalogueClient` ahora propaga la cabecera `Authorization` usando el JWT autenticado del contexto de seguridad
+
+Esto resuelve el problema de la llamada interna `orders -> catalogue` cuando el catálogo ya está protegido con JWT.
+
+---------------------------------------------------------------------
+7) Validaciones técnicas ya ejecutadas
+---------------------------------------------------------------------
+
+Validaciones realizadas durante esta implementación:
+
+1) `ms-users`
+   - `mvn test` ejecutado
+   - resultado final: OK
+
+2) `api-gateway`
+   - `mvn test` ejecutado
+   - resultado final: OK
+   - durante el test intenta contactar Eureka en `localhost:8761`, pero el test termina correctamente aunque Eureka no esté levantado
+
+3) `ms-catalogue`
+   - `mvn test` ejecutado
+   - resultado final: OK
+
+4) `ms-orders`
+   - `mvn test` ejecutado
+   - resultado final: OK
+
+5) `infra/docker-compose.yml`
+   - validado con `docker compose config`
+   - resultado: OK
+
+---------------------------------------------------------------------
+8) Observación importante del IDE
+---------------------------------------------------------------------
+
+Aunque Maven ya compila correctamente los módulos modificados, el analizador del IDE puede seguir mostrando imports de Spring Security o Redis como no resueltos mientras no refresque el modelo Maven del proyecto.
+
+Si ocurre eso en IntelliJ, la acción típica es:
+
+- recargar/reimportar el `pom.xml` del módulo afectado
+
+No significa necesariamente que el código esté mal, especialmente si `mvn test` ya termina en `EXIT_CODE:0`.
+
+---------------------------------------------------------------------
+9) Estado actual de la actividad
+---------------------------------------------------------------------
+
+Hasta este punto YA está hecha la base estructural del criterio de autenticación:
+
+[x] `ms-users` creado
+[x] Redis añadido
+[x] Gateway adaptado
+[x] JWT interno firmado
+[x] token opaco devuelto al frontend
+[x] `ms-catalogue` como resource server
+[x] `ms-orders` como resource server
+[x] propagación de Authorization desde órdenes hacia catálogo
+[x] compilación Maven verificada en los módulos tocados
+
+---------------------------------------------------------------------
+10) Lo siguiente que faltaría hacer
+---------------------------------------------------------------------
+
+Para dejarlo completamente demostrable de extremo a extremo, el siguiente bloque de trabajo sería:
+
+1) levantar `infra` con MySQL + Redis
+2) levantar `eureka-server`
+3) levantar `ms-users`
+4) levantar `ms-catalogue`
+5) levantar `ms-orders`
+6) levantar `api-gateway`
+7) probar login real vía Gateway con `POST /auth/login`
+8) consumir catálogo y órdenes con el token opaco recibido
+9) verificar `401` sin token
+10) verificar `403` con lector en operaciones de admin
+
+Ese paso ya sería validación funcional integrada, no solo compilación y configuración.
+

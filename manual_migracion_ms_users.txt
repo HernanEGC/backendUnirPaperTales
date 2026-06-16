@@ -1,0 +1,213 @@
+MANUAL DE MIGRACION
+Integrar ms-users en microservicios que hoy NO usan login
+
+Contexto
+- Ya existe un servidor de autenticacion: ms-users.
+- El frontend obtiene token opaco desde ms-users (via gateway).
+- El gateway traduce token opaco -> JWT interno.
+- Los microservicios deben validar JWT y aplicar roles.
+
+Objetivo de este manual
+- Migrar microservicios existentes sin romper funcionalidades actuales.
+- Estandarizar autenticacion/autorizacion con ms-users.
+
+=====================================================================
+1) PRINCIPIO CLAVE DE ARQUITECTURA
+=====================================================================
+
+NO debes hacer que cada microservicio "se logee" contra ms-users.
+
+Lo correcto es:
+1. Solo el cliente (frontend) hace login contra /auth/login.
+2. El gateway intercambia token opaco por JWT interno.
+3. Cada microservicio valida el JWT localmente (resource server).
+4. Cada microservicio autoriza por roles/claims.
+
+Si un microservicio tuviera que llamar a ms-users por cada request,
+se pierde el beneficio del patron Phantom Token y aumenta latencia.
+
+=====================================================================
+2) QUE CAMBIA EN UN MS EXISTENTE
+=====================================================================
+
+Supongamos un microservicio existente "ms-x" que hoy es publico.
+
+Debes aplicar estos cambios minimos:
+
+A) Dependencias en pom.xml
+- spring-boot-starter-security
+- spring-boot-starter-oauth2-resource-server
+
+B) Clave publica
+- Copiar public.pem en: src/main/resources/keys/public.pem
+
+C) Configuracion application.yml
+- spring.security.oauth2.resourceserver.jwt.public-key-location=classpath:keys/public.pem
+
+D) Clase de seguridad (ResourceServerConfig)
+- CSRF desactivado para API stateless
+- SessionCreationPolicy.STATELESS
+- anyRequest().authenticated()
+- Converter de roles con claim "roles" y prefijo vacio
+
+E) Reglas de autorizacion en controladores
+- @PreAuthorize segun endpoints de lectura/escritura
+
+F) Gateway
+- Asegurar que la ruta del ms en gateway este marcada como protegida
+- El filtro Phantom Token debe incluir el prefijo externo del ms
+
+=====================================================================
+3) PLANTILLA TECNICA PARA CADA MS
+=====================================================================
+
+1) En pom.xml del ms:
+
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+</dependency>
+
+2) En application.yml del ms:
+
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          public-key-location: classpath:keys/public.pem
+
+3) Clase ResourceServerConfig (esqueleto):
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+public class ResourceServerConfig {
+
+  @Bean
+  SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+      .csrf(csrf -> csrf.disable())
+      .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+      .authorizeHttpRequests(a -> a.anyRequest().authenticated())
+      .oauth2ResourceServer(o -> o.jwt(j -> j.jwtAuthenticationConverter(jwtAuthConverter())));
+    return http.build();
+  }
+
+  @Bean
+  JwtAuthenticationConverter jwtAuthConverter() {
+    JwtGrantedAuthoritiesConverter c = new JwtGrantedAuthoritiesConverter();
+    c.setAuthoritiesClaimName("roles");
+    c.setAuthorityPrefix("");
+    JwtAuthenticationConverter out = new JwtAuthenticationConverter();
+    out.setJwtGrantedAuthoritiesConverter(c);
+    return out;
+  }
+}
+
+=====================================================================
+4) MIGRACION DEL GATEWAY PARA UN MS NUEVO/ANTIGUO
+=====================================================================
+
+Cuando un ms pase a requerir autenticacion:
+
+A) Añadir/ajustar ruta en gateway (application.yml)
+- Ejemplo externo: /inventario/**
+- Rewrite a ruta interna real del ms
+
+B) Incluir ese prefijo en el filtro protegido
+- Si tu filtro protege por prefijos, agregar /inventario/
+
+C) Mantener /auth/** como publico
+- Nunca proteger /auth/login ni /auth/logout
+
+=====================================================================
+5) SI UN MS LLAMA A OTRO MS INTERNAMENTE
+=====================================================================
+
+Caso frecuente: ms-a llama a ms-b con RestTemplate/WebClient.
+
+Si ms-b ya esta protegido con JWT, ms-a debe propagar Authorization.
+
+Regla:
+- tomar JWT autenticado del SecurityContext
+- enviar Authorization: Bearer <jwt> en request saliente
+
+Si no lo haces:
+- ms-b devolvera 401 aunque el usuario haya entrado bien por gateway.
+
+=====================================================================
+6) ESTRATEGIA DE ROLLOUT SIN ROMPER TODO
+=====================================================================
+
+Fase 1 (base)
+- ms-users + redis + gateway phantom token
+- probar login y lectura basica en 1 ms
+
+Fase 2 (migracion progresiva)
+- elegir un ms de bajo riesgo
+- habilitar resource server y roles
+- validar 200/401/403
+
+Fase 3 (resto de ms)
+- repetir patron modulo a modulo
+- actualizar rutas en gateway por cada ms
+- validar llamadas internas entre ms
+
+Fase 4 (hardening)
+- definir politicas por endpoint
+- eliminar endpoints legacy publicos
+- completar pruebas de regresion
+
+=====================================================================
+7) CHECKLIST PARA CADA MICROSERVICIO MIGRADO
+=====================================================================
+
+[ ] Tiene dependencias security + resource-server
+[ ] Tiene public.pem en classpath
+[ ] Tiene config jwt.public-key-location
+[ ] Tiene ResourceServerConfig stateless
+[ ] Tiene @PreAuthorize en endpoints clave
+[ ] Ruta en gateway actualizada
+[ ] Prefijo protegido en filtro phantom token
+[ ] Pruebas de 200/401/403 completas
+[ ] Si llama a otro ms, propaga Authorization
+
+=====================================================================
+8) ERRORES COMUNES Y SOLUCION
+=====================================================================
+
+1) Error: siempre 401
+- causa: no llega Authorization o token opaco expirado
+- revisar: header y TTL redis
+
+2) Error: siempre 403
+- causa: claim roles mal convertido
+- revisar: authoritiesClaimName="roles" y authorityPrefix=""
+
+3) Error: funciona externo pero falla ms->ms
+- causa: no propagaste JWT entre microservicios
+- revisar cliente HTTP interno
+
+4) IDE marca imports de security como rojos
+- causa: indice Maven desactualizado
+- solucion: recargar proyecto Maven
+
+=====================================================================
+9) RECOMENDACION FINAL
+=====================================================================
+
+Para microservicios existentes que no usaban login:
+- no les agregues endpoint de login propio
+- no llames ms-users por cada request
+- conviertelos en resource server
+- centraliza autenticacion en ms-users + gateway
+- aplica autorizacion local por roles y recursos
+
+Con eso quedan alineados al modelo de seguridad del proyecto y son
+faciles de mantener para los siguientes microservicios.
+

@@ -1,0 +1,242 @@
+GUIA PASO A PASO: PRUEBAS CON POSTMAN (ACTIVIDAD 3)
+
+Objetivo
+- Validar login con token opaco (Phantom Token).
+- Validar acceso protegido por roles desde el API Gateway.
+- Comprobar respuestas 200, 401 y 403.
+
+------------------------------------------------------------
+1) LEVANTAR SERVICIOS NECESARIOS
+------------------------------------------------------------
+
+Abre terminales separadas y arranca en este orden:
+
+1. Infra (MySQL + Redis)
+   - Carpeta: /Users/gunnar/Documents/Desarrollo/React_RelatosPapel/infra
+   - Comando: docker compose up -d
+
+2. Eureka
+   - Carpeta: /Users/gunnar/Documents/Desarrollo/React_RelatosPapel/eureka-server
+   - Comando: mvn spring-boot:run
+
+3. Users (autenticacion)
+   - Carpeta: /Users/gunnar/Documents/Desarrollo/React_RelatosPapel/ms-users
+   - Comando: mvn spring-boot:run
+
+4. Catalogue
+   - Carpeta: /Users/gunnar/Documents/Desarrollo/React_RelatosPapel/ms-catalogue
+   - Comando: mvn spring-boot:run
+
+5. Orders
+   - Carpeta: /Users/gunnar/Documents/Desarrollo/React_RelatosPapel/ms-orders
+   - Comando: mvn spring-boot:run
+
+6. API Gateway
+   - Carpeta: /Users/gunnar/Documents/Desarrollo/React_RelatosPapel/api-gateway
+   - Comando: mvn spring-boot:run
+
+Comprobacion rapida (navegador):
+- Eureka UI: http://localhost:8761
+- Debes ver registrados: api-gateway, users, catalogue, orders
+
+------------------------------------------------------------
+2) CREAR ENTORNO EN POSTMAN
+------------------------------------------------------------
+
+Crea un Environment llamado: RelatosPapel-Local
+Variables recomendadas:
+
+- baseUrl = http://localhost:8080
+- opaqueToken = (vacio)
+
+Opcional:
+- lectorEmail = lector@unir.com
+- lectorPass = password123
+- adminEmail = admin@unir.com
+- adminPass = admin123
+
+------------------------------------------------------------
+3) REQUEST 1: LOGIN LECTOR (obtener token opaco)
+------------------------------------------------------------
+
+Metodo: POST
+URL: {{baseUrl}}/auth/login
+Headers:
+- Content-Type: application/json
+Body (raw JSON):
+{
+  "email": "lector@unir.com",
+  "password": "password123"
+}
+
+Esperado:
+- HTTP 200
+- JSON con:
+  - accessToken (token opaco, empieza con rp_opaque_)
+  - tokenType = Bearer
+  - expiresIn = 300
+
+Guardar token automaticamente (opcional, recomendado):
+- En la pestana "Tests" del request agrega:
+
+const json = pm.response.json();
+pm.environment.set("opaqueToken", json.accessToken);
+
+------------------------------------------------------------
+4) REQUEST 2: LOGIN ADMIN (opcional para pruebas de rol)
+------------------------------------------------------------
+
+Metodo: POST
+URL: {{baseUrl}}/auth/login
+Headers:
+- Content-Type: application/json
+Body (raw JSON):
+{
+  "email": "admin@unir.com",
+  "password": "admin123"
+}
+
+Esperado:
+- HTTP 200
+- accessToken opaco
+
+Si quieres, guarda este token en otra variable (por ejemplo adminOpaqueToken).
+
+------------------------------------------------------------
+5) REQUEST 3: ACCESO A CATALOGO (lectura permitida)
+------------------------------------------------------------
+
+Metodo: GET
+URL: {{baseUrl}}/catalogo/api/v1/books
+Headers:
+- Authorization: Bearer {{opaqueToken}}
+
+Esperado:
+- HTTP 200
+- Lista de libros
+
+Que valida:
+- Gateway recibe token opaco
+- Gateway lo cambia por JWT interno
+- Catalogue valida JWT y rol
+
+------------------------------------------------------------
+6) REQUEST 4: ESCRITURA EN CATALOGO CON LECTOR (debe fallar)
+------------------------------------------------------------
+
+Metodo: POST
+URL: {{baseUrl}}/catalogo/api/v1/books
+Headers:
+- Content-Type: application/json
+- Authorization: Bearer {{opaqueToken}}
+Body de ejemplo:
+{
+  "title": "Libro Prueba Seguridad",
+  "author": "UNIR",
+  "code": "SEC-001",
+  "publicationDate": "2026-01-01",
+  "category": "Test",
+  "price": 19.99,
+  "rating": 5,
+  "visible": true,
+  "stock": 10,
+  "imageUrl": "https://example.com/libro.jpg",
+  "description": "Prueba de autorizacion por rol"
+}
+
+Esperado con usuario lector:
+- HTTP 403 Forbidden
+
+------------------------------------------------------------
+7) REQUEST 5: ESCRITURA EN CATALOGO CON ADMIN (debe permitir)
+------------------------------------------------------------
+
+Repite login admin y usa su token opaco.
+
+Metodo: POST
+URL: {{baseUrl}}/catalogo/api/v1/books
+Headers:
+- Content-Type: application/json
+- Authorization: Bearer <token_opaco_admin>
+
+Esperado:
+- HTTP 201 Created (o 200 segun implementacion del endpoint)
+
+------------------------------------------------------------
+8) REQUEST 6: ORDENES (lectura autenticada)
+------------------------------------------------------------
+
+Metodo: GET
+URL: {{baseUrl}}/ordenes/api/v1/orders
+Headers:
+- Authorization: Bearer {{opaqueToken}}
+
+Esperado:
+- HTTP 200
+
+------------------------------------------------------------
+9) REQUEST 7: SIN TOKEN (debe dar 401)
+------------------------------------------------------------
+
+Metodo: GET
+URL: {{baseUrl}}/catalogo/api/v1/books
+Headers:
+- Sin Authorization
+
+Esperado:
+- HTTP 401 Unauthorized
+
+------------------------------------------------------------
+10) REQUEST 8: LOGOUT (invalida token opaco)
+------------------------------------------------------------
+
+Metodo: POST
+URL: {{baseUrl}}/auth/logout
+Headers:
+- Authorization: Bearer {{opaqueToken}}
+
+Esperado:
+- HTTP 204 No Content
+
+Despues de logout, vuelve a probar:
+- GET {{baseUrl}}/catalogo/api/v1/books
+- Con el mismo token opaco
+
+Esperado:
+- HTTP 401 (token ya no existe en Redis)
+
+------------------------------------------------------------
+11) PRUEBA DE EXPIRACION DE TOKEN (TTL)
+------------------------------------------------------------
+
+El TTL actual es 300 segundos (5 minutos).
+
+Pasos:
+1. Haz login y guarda token opaco.
+2. Espera 5 minutos (o un poco mas).
+3. Repite GET /catalogo/api/v1/books con ese token.
+
+Esperado:
+- HTTP 401 Unauthorized
+
+------------------------------------------------------------
+12) CHECKLIST FINAL PARA ENTREGA
+------------------------------------------------------------
+
+[ ] Login lector devuelve token opaco
+[ ] Login admin devuelve token opaco
+[ ] Lector puede leer catalogo (200)
+[ ] Lector no puede crear/modificar catalogo (403)
+[ ] Admin si puede crear/modificar catalogo (201/200)
+[ ] Sin token da 401
+[ ] Logout invalida token
+[ ] Token expirado da 401
+
+------------------------------------------------------------
+Notas utiles
+------------------------------------------------------------
+
+- Todas las pruebas se hacen contra el Gateway: http://localhost:8080
+- No llames directamente a ms-users/ms-catalogue/ms-orders para estas pruebas funcionales de seguridad.
+- Si Postman te devuelve errores de conexion, primero confirma que cada microservicio esta arriba y registrado en Eureka.
+

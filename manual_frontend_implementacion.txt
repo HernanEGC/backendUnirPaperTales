@@ -1,0 +1,361 @@
+MANUAL DE IMPLEMENTACION FRONTEND (REACT)
+Integracion con ms-users + API Gateway (Phantom Token)
+
+Objetivo
+- Implementar login en frontend usando token opaco.
+- Consumir endpoints protegidos via gateway.
+- Manejar estados de sesion, rutas privadas y errores de autorizacion.
+
+Contexto backend esperado
+- Login publico: POST /auth/login (gateway)
+- Logout: POST /auth/logout (gateway)
+- Rutas protegidas: /catalogo/** y /ordenes/** (gateway)
+- El frontend SOLO ve token opaco (rp_opaque_...)
+- El gateway traduce opaco -> JWT interno automaticamente
+
+=====================================================================
+1) PRINCIPIO CLAVE EN FRONTEND
+=====================================================================
+
+NO decodificar JWT en el navegador.
+NO inferir roles desde token (porque es opaco).
+NO llamar microservicios internos directo (usar siempre gateway).
+
+El frontend debe:
+1) hacer login,
+2) guardar token opaco,
+3) enviar Authorization Bearer en cada request protegida,
+4) reaccionar a 401/403.
+
+=====================================================================
+2) ESTRUCTURA RECOMENDADA EN REACT
+=====================================================================
+
+Si usas React + Vite/CRA, una estructura limpia puede ser:
+
+src/
+  api/
+    apiClient.ts
+    authApi.ts
+    catalogueApi.ts
+    ordersApi.ts
+  auth/
+    AuthContext.tsx
+    useAuth.ts
+    ProtectedRoute.tsx
+  pages/
+    LoginPage.tsx
+    CataloguePage.tsx
+    OrdersPage.tsx
+    ForbiddenPage.tsx
+  router/
+    AppRouter.tsx
+  types/
+    auth.ts
+  App.tsx
+
+=====================================================================
+3) VARIABLES DE ENTORNO
+=====================================================================
+
+Define la URL del gateway en entorno.
+
+Ejemplo Vite (.env):
+VITE_API_BASE_URL=http://localhost:8080
+
+Ejemplo CRA (.env):
+REACT_APP_API_BASE_URL=http://localhost:8080
+
+=====================================================================
+4) CLIENTE HTTP CENTRAL (AXIOS)
+=====================================================================
+
+Archivo sugerido: src/api/apiClient.ts
+
+Codigo ejemplo:
+
+import axios from "axios";
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
+
+export const apiClient = axios.create({
+  baseURL: API_BASE_URL,
+  timeout: 15000,
+});
+
+apiClient.interceptors.request.use((config) => {
+  const token = localStorage.getItem("rp_opaque_token");
+  if (token) {
+    config.headers = config.headers ?? {};
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// Manejo centralizado de sesion expirada
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error?.response?.status === 401) {
+      localStorage.removeItem("rp_opaque_token");
+      // opcional: emitir evento global para redirigir a /login
+      window.dispatchEvent(new Event("rp-auth-expired"));
+    }
+    return Promise.reject(error);
+  }
+);
+
+=====================================================================
+5) API DE AUTENTICACION
+=====================================================================
+
+Archivo sugerido: src/api/authApi.ts
+
+import { apiClient } from "./apiClient";
+
+export type LoginRequest = {
+  email: string;
+  password: string;
+};
+
+export type AuthResponse = {
+  accessToken: string;
+  tokenType: string;
+  expiresIn: number;
+};
+
+export async function login(payload: LoginRequest): Promise<AuthResponse> {
+  const { data } = await apiClient.post<AuthResponse>("/auth/login", payload);
+  return data;
+}
+
+export async function logout(): Promise<void> {
+  await apiClient.post("/auth/logout");
+}
+
+=====================================================================
+6) CONTEXTO DE AUTENTICACION
+=====================================================================
+
+Archivo sugerido: src/auth/AuthContext.tsx
+
+Objetivos del contexto:
+- exponer isAuthenticated
+- exponer doLogin(email, password)
+- exponer doLogout()
+- escuchar expiracion global (401)
+
+Esqueleto recomendado:
+
+import { createContext, useEffect, useMemo, useState } from "react";
+import { login, logout } from "../api/authApi";
+
+type AuthContextType = {
+  isAuthenticated: boolean;
+  loading: boolean;
+  doLogin: (email: string, password: string) => Promise<void>;
+  doLogout: () => Promise<void>;
+};
+
+export const AuthContext = createContext<AuthContextType | null>(null);
+
+export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const [loading, setLoading] = useState(true);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+
+  useEffect(() => {
+    const token = localStorage.getItem("rp_opaque_token");
+    setIsAuthenticated(Boolean(token));
+    setLoading(false);
+
+    const handler = () => setIsAuthenticated(false);
+    window.addEventListener("rp-auth-expired", handler);
+    return () => window.removeEventListener("rp-auth-expired", handler);
+  }, []);
+
+  const doLogin = async (email: string, password: string) => {
+    const auth = await login({ email, password });
+    localStorage.setItem("rp_opaque_token", auth.accessToken);
+    setIsAuthenticated(true);
+  };
+
+  const doLogout = async () => {
+    try {
+      await logout();
+    } finally {
+      localStorage.removeItem("rp_opaque_token");
+      setIsAuthenticated(false);
+    }
+  };
+
+  const value = useMemo(
+    () => ({ isAuthenticated, loading, doLogin, doLogout }),
+    [isAuthenticated, loading]
+  );
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+}
+
+Hook sugerido: src/auth/useAuth.ts
+- valida que el contexto exista y lo retorna.
+
+=====================================================================
+7) RUTAS PRIVADAS
+=====================================================================
+
+Archivo sugerido: src/auth/ProtectedRoute.tsx
+
+Idea:
+- si loading: mostrar spinner
+- si no autenticado: navegar a /login
+- si autenticado: renderizar children
+
+Ejemplo:
+
+import { Navigate } from "react-router-dom";
+import { useAuth } from "./useAuth";
+
+export function ProtectedRoute({ children }: { children: JSX.Element }) {
+  const { isAuthenticated, loading } = useAuth();
+
+  if (loading) return <div>Cargando...</div>;
+  if (!isAuthenticated) return <Navigate to="/login" replace />;
+
+  return children;
+}
+
+Router ejemplo:
+- /login publico
+- /catalogo privado
+- /ordenes privado
+
+=====================================================================
+8) PAGINA DE LOGIN
+=====================================================================
+
+Flujo recomendado:
+1) Capturar email/password
+2) Llamar doLogin
+3) Si OK -> navigate("/catalogo")
+4) Si 401 -> mostrar mensaje "Credenciales invalidas"
+
+Mensaje UX recomendado:
+- No mostrar detalles internos del backend.
+- Mensaje simple y claro para usuario final.
+
+=====================================================================
+9) CONSUMO DE CATALOGO Y ORDENES
+=====================================================================
+
+Siempre a traves del gateway:
+- GET /catalogo/api/v1/books
+- GET /ordenes/api/v1/orders
+
+No usar URLs internas tipo http://catalogue:8081 desde navegador.
+
+Archivo sugerido src/api/catalogueApi.ts
+
+import { apiClient } from "./apiClient";
+
+export async function getBooks() {
+  const { data } = await apiClient.get("/catalogo/api/v1/books");
+  return data;
+}
+
+Archivo sugerido src/api/ordersApi.ts
+
+import { apiClient } from "./apiClient";
+
+export async function getOrders() {
+  const { data } = await apiClient.get("/ordenes/api/v1/orders");
+  return data;
+}
+
+=====================================================================
+10) MANEJO DE ERRORES 401 Y 403
+=====================================================================
+
+Caso 401 (no autenticado/token invalido o expirado)
+- limpiar localStorage
+- redirigir a /login
+- aviso: "Tu sesion ha expirado"
+
+Caso 403 (autenticado pero sin permiso)
+- mantener sesion
+- redirigir a pagina /forbidden o mostrar banner
+- aviso: "No tienes permisos para esta accion"
+
+=====================================================================
+11) BOTON DE LOGOUT
+=====================================================================
+
+Recomendacion:
+- al pulsar logout llamar doLogout()
+- luego navegar a /login
+- limpiar cualquier cache de datos de usuario (si usas React Query, Zustand, etc.)
+
+=====================================================================
+12) SEGURIDAD FRONTEND: BUENAS PRACTICAS
+=====================================================================
+
+1) Token en memoria vs localStorage
+- Para practica academica, localStorage es aceptable.
+- En produccion, valorar estrategia mas robusta (cookies httpOnly o mitigaciones XSS).
+
+2) No loguear tokens en consola
+- Evitar console.log(accessToken).
+
+3) CORS
+- Debe estar resuelto en gateway (ya lo tienes abierto). Ajustar en prod.
+
+4) Timeout de sesion
+- El TTL actual backend es 300s.
+- Debes aceptar que el token caduque y manejar 401 limpiamente.
+
+=====================================================================
+13) CHECKLIST DE IMPLEMENTACION FRONTEND
+=====================================================================
+
+[ ] Entorno con API base URL del gateway
+[ ] Axios client con interceptor Authorization
+[ ] AuthContext con login/logout/isAuthenticated
+[ ] ProtectedRoute funcionando
+[ ] LoginPage con manejo de error 401
+[ ] Paginas de catalogo/ordenes consumiendo gateway
+[ ] Manejo global de 401 (sesion expirada)
+[ ] Manejo de 403 (sin permisos)
+[ ] Boton de logout operativo
+
+=====================================================================
+14) CHECKLIST DE PRUEBAS MANUALES (FRONT)
+=====================================================================
+
+1) Login lector correcto
+- debe navegar a pantalla privada
+
+2) Login incorrecto
+- debe mostrar error sin romper UI
+
+3) Acceso directo a ruta privada sin token
+- debe redirigir a /login
+
+4) Consumir catalogo con sesion activa
+- debe cargar datos
+
+5) Ejecutar accion admin con lector
+- debe recibir 403 y mostrar mensaje de permiso
+
+6) Logout
+- debe limpiar token y mandar a /login
+
+7) Esperar expiracion (5 min) y volver a consumir
+- debe caer en 401 y cerrar sesion frontend
+
+=====================================================================
+15) MENSAJE PARA MEMORIA/DEFENSA (FRONTEND)
+=====================================================================
+
+Frase sugerida:
+
+"En frontend se implemento un cliente stateless que opera exclusivamente con token opaco. La autenticacion se realiza contra /auth/login del gateway y todas las llamadas protegidas incluyen Authorization Bearer con ese token opaco. Ante 401 se invalida la sesion local y ante 403 se informa falta de permisos, manteniendo separada la logica de UX de la logica criptografica interna manejada por gateway y microservicios."
+
