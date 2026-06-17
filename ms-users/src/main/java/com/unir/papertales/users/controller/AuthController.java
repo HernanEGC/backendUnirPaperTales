@@ -2,6 +2,8 @@ package com.unir.papertales.users.controller;
 
 import com.unir.papertales.users.dto.AuthResponse;
 import com.unir.papertales.users.dto.LoginRequest;
+import com.unir.papertales.users.dto.RegisterUserRequest;
+import com.unir.papertales.users.dto.RegisterUserResponse;
 import com.unir.papertales.users.service.AuthService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -27,10 +29,14 @@ public class AuthController {
         return ResponseEntity.ok(authService.login(loginRequest));
     }
 
+    @PostMapping("/register")
+    public ResponseEntity<RegisterUserResponse> register(@Valid @RequestBody RegisterUserRequest registerUserRequest) {
+        return ResponseEntity.status(HttpStatus.CREATED).body(authService.register(registerUserRequest));
+    }
+
     @PostMapping("/logout")
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public void logout(@RequestHeader(HttpHeaders.AUTHORIZATION) String authorizationHeader) {
         authService.logout(authorizationHeader);
     }
 }
-

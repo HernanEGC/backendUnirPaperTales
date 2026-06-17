@@ -49,6 +49,10 @@ eureka:
       defaultZone: ${EUREKA_URL:http://localhost:8761/eureka}
   instance:
     preferIpAddress: false
+    # 🚨 SOLUCIÓN AQUÍ: Forzamos un ID limpio basado en el nombre y puerto (Elimina la IP de Eureka)
+    instanceId: ${spring.application.name}:${server.port}:${random.value}
+    # Declaramos el nombre lógico del host dentro de la red del clúster
+    #hostname: ${spring.application.name}
     hostname: localhost
 
 

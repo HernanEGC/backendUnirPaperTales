@@ -44,9 +44,13 @@ public class PhantomTokenGatewayFilter implements GlobalFilter, Ordered {
                     ServerHttpRequest mutatedRequest = request.mutate()
                             .headers(headers -> headers.setBearerAuth(internalJwt))
                             .build();
-                    return chain.filter(exchange.mutate().request(mutatedRequest).build());
+                    return chain.filter(exchange.mutate().request(mutatedRequest).build())
+                            .thenReturn(Boolean.TRUE);
                 })
-                .switchIfEmpty(onError(exchange, HttpStatus.UNAUTHORIZED));
+                .defaultIfEmpty(Boolean.FALSE)
+                .flatMap(tokenResolved -> tokenResolved
+                        ? Mono.empty()
+                        : onError(exchange, HttpStatus.UNAUTHORIZED));
     }
 
     private boolean isPublicPath(String path) {

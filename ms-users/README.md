@@ -37,6 +37,35 @@ Requiere:
 Authorization: Bearer <opaqueToken>
 ```
 
+### `POST /api/v1/auth/register`
+
+Body:
+
+```json
+{
+  "email": "nuevo@unir.com",
+  "password": "password123",
+  "role": "ROLE_LECTOR",
+  "enabled": true
+}
+```
+
+Notas:
+
+- `role` es opcional (si no se envía, se usa `ROLE_LECTOR`)
+- roles válidos: `ROLE_LECTOR`, `ROLE_ADMIN`
+
+Respuesta `201 Created`:
+
+```json
+{
+  "id": 3,
+  "email": "nuevo@unir.com",
+  "role": "ROLE_LECTOR",
+  "enabled": true
+}
+```
+
 ## Usuarios de prueba
 
 - `lector@unir.com` / `password123`
@@ -54,4 +83,3 @@ Authorization: Bearer <opaqueToken>
 cd "/Users/gunnar/Documents/Desarrollo/React_RelatosPapel/ms-users"
 mvn spring-boot:run
 ```
-

@@ -57,8 +57,10 @@ spring:
 
 eureka:
   instance:
+    # hostname: ${spring.application.name}
     hostname: localhost
-    preferIpAddress: true
+    preferIpAddress: false
+    instanceId: ${spring.application.name}:${server.port}
   client:
     registerWithEureka: true
     fetchRegistry: true

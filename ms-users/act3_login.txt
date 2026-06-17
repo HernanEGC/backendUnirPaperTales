@@ -358,7 +358,7 @@ Antes de implementar, corrige mentalmente estos puntos de la guía anterior:
    Debe ser:
    `private Mono<Void> onError(...)`
 
-3) Los nombres de servicio del ejemplo no coinciden con este proyecto.
+3) Los nombres de servicio.
    En este repo debes trabajar con:
    - `lb://catalogue`
    - `lb://orders`
@@ -757,7 +757,9 @@ Puntos que conviene dejar muy claros:
 
 Frase útil para la memoria:
 
-"Se implementa el patrón Phantom Token para separar la seguridad externa de la interna. El cliente opera con un token opaco sin semántica, mientras que el API Gateway lo intercambia por un JWT interno firmado, permitiendo que los microservicios validen permisos localmente sin depender de introspecciones remotas en cada petición."
+"Se implementa el patrón Phantom Token para separar la seguridad externa de la interna.
+El cliente opera con un token opaco sin semántica, mientras que el API Gateway lo intercambia por un JWT interno firmado,
+permitiendo que los microservicios validen permisos localmente sin depender de introspecciones remotas en cada petición."
 
 =====================================================================
 ORDEN DE IMPLEMENTACIÓN RECOMENDADO
